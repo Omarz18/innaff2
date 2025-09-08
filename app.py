@@ -5,7 +5,7 @@ import logging
 import requests
 import phonenumbers
 from typing import Optional
-from subprocess import check_output, CalledProcessError, TimeoutExpired
+from subprocess import Popen, PIPE, CalledProcessError, TimeoutExpired
 from phonenumbers import carrier, geocoder, number_type, PhoneNumberType
 
 from telegram import Update, BotCommand
@@ -25,11 +25,23 @@ log = logging.getLogger("app")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # مسار اسم المالك القابل للتهيئة:
-OWNER_MODULE = os.getenv("OWNER_MODULE", "").strip()           # مثال: who_is_this_main
-OWNER_FUNC = os.getenv("OWNER_FUNC", "").strip()               # مثال: lookup_owner
-OWNER_SCRIPT = os.getenv("OWNER_SCRIPT", "").strip()           # مثال: who_is_this.py
-OWNER_ARGS = os.getenv("OWNER_ARGS", "--number {number} --json").strip()  # وسيستبدل {number} بـ E164
+# 1) موديول + دالة (اختياري)
+OWNER_MODULE = os.getenv("OWNER_MODULE", "").strip()
+OWNER_FUNC = os.getenv("OWNER_FUNC", "").strip()
+
+# 2) سكربت عادي بوسائط (اختياري) — تم الإبقاء عليه لو عندك سكربت يقبل args
+OWNER_SCRIPT = os.getenv("OWNER_SCRIPT", "").strip()
+OWNER_ARGS = os.getenv("OWNER_ARGS", "--number {number} --json").strip()
 OWNER_SCRIPT_JSON_KEY = os.getenv("OWNER_SCRIPT_JSON_KEY", "name").strip()
+
+# 3) سكربت تفاعلي عبر stdin (الحالة اللي عندك)
+OWNER_INTERACTIVE_SCRIPT = os.getenv("OWNER_INTERACTIVE_SCRIPT", "").strip()  # مثال: who-is-this.py
+OWNER_INTERACTIVE_CWD = os.getenv("OWNER_INTERACTIVE_CWD", "").strip()        # مثال: Who-is-this-main
+# سيتم استبدال {number} بالرقم بصيغة +E164
+OWNER_STDIN_TEMPLATE = os.getenv("OWNER_STDIN_TEMPLATE", "2\\n{number}\\n99\\n")
+# نمط لإخراج الاسم من stdout. افتراضي يلتقط أي سطر يحتوي [+] name : <الاسم>
+OWNER_OUTPUT_REGEX = os.getenv("OWNER_OUTPUT_REGEX", r"\\[\\+\\]\\s*name\\s*:\\s*(.+)")
+OWNER_TIMEOUT = int(os.getenv("OWNER_TIMEOUT", "25"))
 
 # ===== حالات المحادثة =====
 ASK_USERNAME = 1      # /ig
@@ -39,25 +51,17 @@ PHONE_STEP = 10       # /phone
 def _livecounts_headers():
     return {
         'Host': 'api.livecounts.io',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/111.0',
+        'User-Agent': 'Mozilla/5.0',
         'Accept': '*/*',
-        'Accept-Language': 'ar,en-US;q=0.7,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
         'Origin': 'https://livecounts.io',
     }
 
 def _storiesig_headers():
     return {
         'Host': 'storiesig.info',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/111.0',
+        'User-Agent': 'Mozilla/5.0',
         'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'ar,en-US;q=0.7,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
         'Referer': 'https://storiesig.info/en/',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-        'Te': 'trailers',
     }
 
 def fetch_from_livecounts(username: str) -> str:
@@ -83,7 +87,8 @@ def fetch_from_livecounts(username: str) -> str:
                 headers=h, timeout=15
             )
             if r2.ok and '"success":true' in r2.text:
-                m = re.findall(r"(.*?),(.*?),(.*?),(.*?)]", str(r2.json().get("userData")))
+                import re as _re
+                m = _re.findall(r"(.*?),(.*?),(.*?),(.*?)]", str(r2.json().get("userData")))
                 if m:
                     t = m[0]
                     name = str(t[2]).replace("'username': '", '').replace("'", "")
@@ -111,7 +116,7 @@ def fetch_from_livecounts(username: str) -> str:
             if posts is not None:     parts.append(f"- Posts: {posts}")
     except Exception as e:
         log.warning("livecounts error: %s", e)
-    return "\n".join(parts).strip()
+    return "\\n".join(parts).strip()
 
 def fetch_from_storiesig(username: str) -> Optional[str]:
     try:
@@ -121,7 +126,7 @@ def fetch_from_storiesig(username: str) -> Optional[str]:
         )
         if r.ok and (username in r.text):
             res = r.json().get("result", {})
-            return "\n".join([
+            return "\\n".join([
                 f"- Name: {res.get('full_name')}",
                 f"- Bio: {res.get('biography')}",
                 f"- userID: {res.get('id')}",
@@ -140,13 +145,15 @@ def fetch_from_private_api(username: str) -> Optional[str]:
         r = requests.post(
             "https://i.instagram.com:443/api/v1/users/lookup/",
             headers={
-                "Connection": "close","X-IG-Connection-Type":"WIFI","mid":"XOSINgABAAG1IDmaral3noOozrK0rrNSbPuSbzHq",
-                "X-IG-Capabilities":"3R4=","Accept-Language":"ar-sa",
+                "Connection": "close",
+                "X-IG-Connection-Type":"WIFI",
+                "X-IG-Capabilities":"3R4=",
+                "Accept-Language":"ar-sa",
                 "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
-                "User-Agent":"Instagram 99.4.0 vv1ck_TweakPY (TweakPY_vv1ck)",
+                "User-Agent":"Instagram 99.4.0",
                 "Accept-Encoding":"gzip, deflate"
             },
-            data={"signed_body": f"35a2d547d3b6ff400f713948cdffe0b789a903f86117eb6e2f3e573079b2f038.{{\"q\":\"{username}\"}}"},
+            data={"signed_body": f"sig.{{\"q\":\"{username}\"}}"},
             timeout=15
         )
         if (not r.ok) or 'No users found' in r.text or '"spam":true' in r.text:
@@ -165,7 +172,7 @@ def fetch_from_private_api(username: str) -> Optional[str]:
             f"- Can Sms Reset: {jd.get('can_sms_reset')}",
             f"- Profile Pic URL: {u.get('profile_pic_url')}",
         ]
-        return "\n".join(lines)
+        return "\\n".join(lines)
     except Exception as e:
         log.warning("private api error: %s", e)
         return None
@@ -200,7 +207,7 @@ def lookup_owner_from_module(e164: str) -> Optional[str]:
         if callable(fn):
             name = fn(e164)
             if isinstance(name, str) and name.strip():
-                log.info("Owner name resolved via module %s.%s", OWNER_MODULE, OWNER_FUNC)
+                log.info("Owner via module %s.%s", OWNER_MODULE, OWNER_FUNC)
                 return name.strip()
     except Exception as e:
         log.warning("module lookup failed: %s", e)
@@ -210,40 +217,66 @@ def lookup_owner_from_script(e164: str) -> Optional[str]:
     if not OWNER_SCRIPT:
         return None
     try:
-        # استبدال {number} في ARGS
         args = OWNER_ARGS.replace("{number}", e164).strip()
         cmd = ["python", OWNER_SCRIPT] + [a for a in args.split() if a]
-        out = check_output(cmd, timeout=25).decode("utf-8", "ignore").strip()
-        # جرّب JSON أولاً
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE)
+        out, _ = p.communicate(timeout=OWNER_TIMEOUT)
+        out = out.decode("utf-8", "ignore").strip()
         try:
             j = json.loads(out)
             val = j.get(OWNER_SCRIPT_JSON_KEY) or j.get("owner") or j.get("caller_name") or j.get("name")
             if isinstance(val, str) and val.strip():
-                log.info("Owner name resolved via script %s (%s)", OWNER_SCRIPT, OWNER_SCRIPT_JSON_KEY)
+                log.info("Owner via script JSON (%s)", OWNER_SCRIPT)
                 return val.strip()
         except Exception:
-            # لو مش JSON، خذ آخر سطر نصي
             if out:
                 line = out.splitlines()[-1].strip()
                 if line:
-                    log.info("Owner name resolved via script raw text")
+                    log.info("Owner via script raw text (%s)", OWNER_SCRIPT)
                     return line
     except (CalledProcessError, TimeoutExpired) as e:
         log.warning("script lookup failed: %s", e)
     return None
 
+def lookup_owner_from_interactive(e164: str) -> Optional[str]:
+    if not OWNER_INTERACTIVE_SCRIPT:
+        return None
+    try:
+        cmd = ["python", OWNER_INTERACTIVE_SCRIPT]
+        cwd = OWNER_INTERACTIVE_CWD or None
+        p = Popen(cmd, cwd=cwd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        stdin_data = (OWNER_STDIN_TEMPLATE.replace("{number}", e164)).encode("utf-8")
+        out, err = p.communicate(input=stdin_data, timeout=OWNER_TIMEOUT)
+        text = out.decode("utf-8", "ignore")
+        if not text:
+            text = err.decode("utf-8", "ignore")
+        if text:
+            m = re.search(OWNER_OUTPUT_REGEX, text, re.IGNORECASE)
+            if m and m.group(1).strip():
+                name = m.group(1).strip()
+                log.info("Owner via interactive script (%s)", OWNER_INTERACTIVE_SCRIPT)
+                return name
+        log.warning("interactive script produced no match. Regex used: %s", OWNER_OUTPUT_REGEX)
+    except (CalledProcessError, TimeoutExpired) as e:
+        log.warning("interactive lookup failed: %s", e)
+    return None
+
 def lookup_owner_name(e164: Optional[str]) -> Optional[str]:
     if not e164:
         return None
-    # 1) جرّب الموديول
+    # الأول: موديول
     name = lookup_owner_from_module(e164)
     if name:
         return name
-    # 2) جرّب السكربت
+    # الثاني: سكربت بوسائط
     name = lookup_owner_from_script(e164)
     if name:
         return name
-    log.info("Owner name not found (module/script not configured or returned empty).")
+    # الثالث: سكربت تفاعلي عبر stdin
+    name = lookup_owner_from_interactive(e164)
+    if name:
+        return name
+    log.info("Owner name not found (no configured provider matched).")
     return None
 
 def phone_summary(raw: str, default_region: Optional[str] = None) -> str:
@@ -287,22 +320,22 @@ def phone_summary(raw: str, default_region: Optional[str] = None) -> str:
         f"- Type: {typ_name}",
         f"- Carrier: {carr}",
     ]
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 # =========================== Handlers ===========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلًا 👋\n"
-        "الأوامر المتاحة:\n"
-        "/phone — استخراج تفاصيل رقم جوال (+ اسم المالك إذا ضبطت OWNER_MODULE/OWNER_SCRIPT)\n"
-        "/ig — معلومات إنستغرام\n"
+        "أهلًا 👋\\n"
+        "الأوامر المتاحة:\\n"
+        "/phone — استخراج تفاصيل رقم جوال (+ اسم المالك لو تم ضبطه)\\n"
+        "/ig — معلومات إنستغرام\\n"
         "/cancel — إلغاء العملية الحالية"
     )
 
 # /phone
 async def phone_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أرسل رقم الجوال.\nأمثلة:\n- +966512345678\n- 966 512345678\n- 0512345678"
+        "أرسل رقم الجوال.\\nأمثلة:\\n- +966512345678\\n- 966 512345678\\n- 0512345678"
     )
     return PHONE_STEP
 
@@ -313,10 +346,10 @@ async def phone_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     owner = lookup_owner_name(e164)
     if owner:
-        result += f"\n- Owner Name: {owner}"
+        result += f"\\n- Owner Name: {owner}"
 
     if len(result) > 4000:
-        result = result[:4000] + "\n...\n(تم قص النتيجة لطولها)"
+        result = result[:4000] + "\\n...\\n(تم قص النتيجة لطولها)"
     await update.message.reply_text(result)
     return ConversationHandler.END
 
@@ -330,7 +363,7 @@ async def ig_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("لحظة... جارِ جلب البيانات 🔎")
     text = instagram_info(username)
     if len(text) > 4000:
-        text = text[:4000] + "\n...\n(النتيجة طويلة فتم قصّها)"
+        text = text[:4000] + "\\n...\\n(النتيجة طويلة فتم قصّها)"
     await update.message.reply_text(text)
     return ConversationHandler.END
 
