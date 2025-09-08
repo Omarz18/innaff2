@@ -1,23 +1,32 @@
 import os
 import re
+import logging
 import requests
 import phonenumbers
+from typing import Optional
 from phonenumbers import carrier, geocoder, number_type, PhoneNumberType
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     ContextTypes, filters
 )
 
-# ========= إعداد التوكن =========
+# ===== إعداد اللوجينج =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("app")
+
+# ===== متغيرات البيئة =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# ========= حالات المحادثة =========
-ASK_USERNAME = 1      # لمحاورة /ig
-PHONE_STEP = 10       # لمحاورة /phone
+# ===== حالات المحادثة =====
+ASK_USERNAME = 1      # /ig
+PHONE_STEP = 10       # /phone
 
-# ========= أداة إنستغرام (/ig) =========
+# =========================== إنستغرام (/ig) ===========================
 def _livecounts_headers():
     return {
         'Host': 'api.livecounts.io',
@@ -50,7 +59,7 @@ def fetch_from_livecounts(username: str) -> str:
             f'https://api.livecounts.io/instagram-live-follower-counter/data/{username}',
             headers=h, timeout=15
         )
-        if '"success":true' in r1.text:
+        if r1.ok and '"success":true' in r1.text:
             jd = r1.json()
             parts += [
                 f"- Name: {jd.get('name')}",
@@ -64,7 +73,7 @@ def fetch_from_livecounts(username: str) -> str:
                 f'https://api.livecounts.io/instagram-live-follower-counter/search/{username}',
                 headers=h, timeout=15
             )
-            if '"success":true' in r2.text:
+            if r2.ok and '"success":true' in r2.text:
                 m = re.findall(r"(.*?),(.*?),(.*?),(.*?)]", str(r2.json().get("userData")))
                 if m:
                     t = m[0]
@@ -75,12 +84,11 @@ def fetch_from_livecounts(username: str) -> str:
                     maybe_pic = str(t[0]).replace("'", '').replace("avatar", '').replace("[{:", '')
                     if maybe_pic.strip():
                         parts.append(f"- Profile Pic URL: {maybe_pic}")
-
         r3 = requests.get(
             f'https://api.livecounts.io/instagram-live-follower-counter/stats/{username}',
             headers=h, timeout=15
         )
-        if '"success":true' in r3.text:
+        if r3.ok and '"success":true' in r3.text:
             jd3 = r3.json()
             followers = jd3.get('followerCount')
             bottom = str(jd3.get("bottomOdos"))
@@ -92,17 +100,17 @@ def fetch_from_livecounts(username: str) -> str:
             if followers is not None: parts.append(f"- Followers Count: {followers}")
             if following is not None: parts.append(f"- Following: {following}")
             if posts is not None:     parts.append(f"- Posts: {posts}")
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("livecounts error: %s", e)
     return "\n".join(parts).strip()
 
-def fetch_from_storiesig(username: str) -> str | None:
+def fetch_from_storiesig(username: str) -> Optional[str]:
     try:
         r = requests.get(
             f'https://storiesig.info/api/ig/profile/{username}',
             headers=_storiesig_headers(), timeout=15
         )
-        if username in r.text:
+        if r.ok and (username in r.text):
             res = r.json().get("result", {})
             return "\n".join([
                 f"- Name: {res.get('full_name')}",
@@ -114,11 +122,11 @@ def fetch_from_storiesig(username: str) -> str | None:
                 f"- Posts: {res.get('edge_owner_to_timeline_media',{}).get('count')}",
                 f"- Profile Pic URL: {res.get('profile_pic_url')}",
             ])
-    except Exception:
-        return None
+    except Exception as e:
+        log.warning("storiesig error: %s", e)
     return None
 
-def fetch_from_private_api(username: str) -> str | None:
+def fetch_from_private_api(username: str) -> Optional[str]:
     try:
         r = requests.post(
             "https://i.instagram.com:443/api/v1/users/lookup/",
@@ -132,7 +140,7 @@ def fetch_from_private_api(username: str) -> str | None:
             data={"signed_body": f"35a2d547d3b6ff400f713948cdffe0b789a903f86117eb6e2f3e573079b2f038.{{\"q\":\"{username}\"}}"},
             timeout=15
         )
-        if 'No users found' in r.text or '"spam":true' in r.text:
+        if (not r.ok) or 'No users found' in r.text or '"spam":true' in r.text:
             return None
         jd = r.json()
         u = jd.get('user', {})
@@ -149,7 +157,8 @@ def fetch_from_private_api(username: str) -> str | None:
             f"- Profile Pic URL: {u.get('profile_pic_url')}",
         ]
         return "\n".join(lines)
-    except Exception:
+    except Exception as e:
+        log.warning("private api error: %s", e)
         return None
 
 def instagram_info(username: str) -> str:
@@ -159,8 +168,75 @@ def instagram_info(username: str) -> str:
             return res
     return "تعذّر الحصول على معلومات هذا الحساب حالياً."
 
-# ========= أداة الجوال (/phone) =========
-def phone_summary(raw: str, default_region: str | None = None) -> str:
+# =========================== الجوال (/phone) ===========================
+def to_e164(raw: str, default_region: Optional[str] = None) -> Optional[str]:
+    s = (raw or "").strip().replace("−", "-")
+    try:
+        if s.startswith("+"):
+            pn = phonenumbers.parse(s, None)
+        else:
+            pn = phonenumbers.parse(s, default_region)
+        if phonenumbers.is_possible_number(pn):
+            return phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164)
+    except phonenumbers.NumberParseException:
+        return None
+    return None
+
+def lookup_owner_name_local(e164: Optional[str]) -> Optional[str]:
+    """
+    يحاول استخدام مزودك المحلي (الموجود داخل نفس الريبو).
+    - أولاً: import لموديول بأسماء شائعة.
+    - ثانيًا: تشغيل سكربت CLI إن وجد.
+    يجب أن يعيد الموديول/السكربت اسم المالك كنص.
+    """
+    if not e164:
+        return None
+
+    # 1) محاولة import لموديولات شائعة
+    module_names = [
+        "who_is_this", "whoisthis", "who_is_this_main", "who_is_owner", "owner_lookup"
+    ]
+    for mname in module_names:
+        try:
+            mod = __import__(mname)
+            # جرّب دوال شائعة
+            for fn in ("lookup_owner", "get_owner", "owner_name", "lookup"):
+                if hasattr(mod, fn):
+                    name = getattr(mod, fn)(e164)
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
+        except Exception:
+            pass
+
+    # 2) محاولة تشغيل سكربت CLI داخل الريبو
+    # أمثلة أسماء محتملة:
+    script_names = [
+        "who_is_this.py", "whoisthis.py", "main.py", "lookup.py", "owner_lookup.py"
+    ]
+    import subprocess, json, shlex
+    for sname in script_names:
+        if os.path.exists(os.path.join(os.getcwd(), sname)):
+            try:
+                # نفترض أن السكربت يقبل --number ويرجع JSON فيه name/owner/caller_name
+                cmd = ["python", sname, "--number", e164, "--json"]
+                out = subprocess.check_output(cmd, timeout=25).decode("utf-8", "ignore")
+                # حاول JSON
+                try:
+                    j = json.loads(out)
+                    for key in ("name", "owner", "caller_name"):
+                        if key in j and str(j[key]).strip():
+                            return str(j[key]).strip()
+                except Exception:
+                    # جرّب أن الإخراج نصي فقط
+                    line = out.strip().splitlines()[-1].strip() if out.strip() else ""
+                    if line:
+                        return line
+            except Exception:
+                pass
+
+    return None
+
+def phone_summary(raw: str, default_region: Optional[str] = None) -> str:
     s = (raw or "").strip().replace("−", "-")
     try:
         if s.startswith("+"):
@@ -169,13 +245,11 @@ def phone_summary(raw: str, default_region: str | None = None) -> str:
             pn = phonenumbers.parse(s, default_region)
     except phonenumbers.NumberParseException as e:
         return f"رقم غير صالح: {e}"
-
     valid = phonenumbers.is_valid_number(pn)
     possible = phonenumbers.is_possible_number(pn)
     e164 = phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164) if possible else "غير متاح"
     intl = phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.INTERNATIONAL) if possible else "غير متاح"
     natl = phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.NATIONAL) if possible else "غير متاح"
-
     reg = geocoder.description_for_number(pn, "en") or "Unknown"
     carr = carrier.name_for_number(pn, "en") or "Unknown"
     typ  = number_type(pn)
@@ -193,7 +267,6 @@ def phone_summary(raw: str, default_region: str | None = None) -> str:
         PhoneNumberType.VOICEMAIL: "Voicemail",
         PhoneNumberType.UNKNOWN: "Unknown",
     }.get(typ, "Unknown")
-
     lines = [
         f"- Valid: {valid}",
         f"- Possible: {possible}",
@@ -206,16 +279,17 @@ def phone_summary(raw: str, default_region: str | None = None) -> str:
     ]
     return "\n".join(lines)
 
-# ========= Handlers =========
+# =========================== Handlers ===========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلًا 👋\n"
         "الأوامر المتاحة:\n"
-        "/phone — استخراج تفاصيل رقم جوال\n"
-        "/ig — معلومات إنستغرام"
+        "/phone — استخراج تفاصيل رقم جوال (+ اسم المالك من مزودك المحلي إن وُجد)\n"
+        "/ig — معلومات إنستغرام\n"
+        "/cancel — إلغاء العملية الحالية"
     )
 
-# === /phone ===
+# /phone
 async def phone_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل رقم الجوال.\nأمثلة:\n- +966512345678\n- 966 512345678\n- 0512345678"
@@ -225,12 +299,19 @@ async def phone_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def phone_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = (update.message.text or "").strip()
     result = phone_summary(user_input, default_region="SA")
+
+    # اسم صاحب الرقم عبر مزودك المحلي (إن وُجد)
+    e164 = to_e164(user_input, default_region="SA")
+    owner = lookup_owner_name_local(e164)
+    if owner:
+        result += f"\n- Owner Name: {owner}"
+
     if len(result) > 4000:
         result = result[:4000] + "\n...\n(تم قص النتيجة لطولها)"
     await update.message.reply_text(result)
     return ConversationHandler.END
 
-# === /ig ===
+# /ig
 async def ig_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("أرسل اسم المستخدم في إنستغرام (بدون @).")
     return ASK_USERNAME
@@ -248,11 +329,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم الإلغاء.")
     return ConversationHandler.END
 
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start", "تعليمات وأوامر"),
+        BotCommand("phone", "تحليل رقم جوال (+اسم محلي)"),
+        BotCommand("ig", "معلومات إنستغرام"),
+        BotCommand("cancel", "إلغاء العملية الحالية"),
+    ])
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("يرجى ضبط متغير البيئة TELEGRAM_TOKEN")
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     conv_phone = ConversationHandler(
         entry_points=[CommandHandler("phone", phone_entry)],
