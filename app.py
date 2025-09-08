@@ -1,9 +1,11 @@
 import os
 import re
+import json
 import logging
 import requests
 import phonenumbers
 from typing import Optional
+from subprocess import check_output, CalledProcessError, TimeoutExpired
 from phonenumbers import carrier, geocoder, number_type, PhoneNumberType
 
 from telegram import Update, BotCommand
@@ -21,6 +23,13 @@ log = logging.getLogger("app")
 
 # ===== متغيرات البيئة =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# مسار اسم المالك القابل للتهيئة:
+OWNER_MODULE = os.getenv("OWNER_MODULE", "").strip()           # مثال: who_is_this_main
+OWNER_FUNC = os.getenv("OWNER_FUNC", "").strip()               # مثال: lookup_owner
+OWNER_SCRIPT = os.getenv("OWNER_SCRIPT", "").strip()           # مثال: who_is_this.py
+OWNER_ARGS = os.getenv("OWNER_ARGS", "--number {number} --json").strip()  # وسيستبدل {number} بـ E164
+OWNER_SCRIPT_JSON_KEY = os.getenv("OWNER_SCRIPT_JSON_KEY", "name").strip()
 
 # ===== حالات المحادثة =====
 ASK_USERNAME = 1      # /ig
@@ -182,58 +191,59 @@ def to_e164(raw: str, default_region: Optional[str] = None) -> Optional[str]:
         return None
     return None
 
-def lookup_owner_name_local(e164: Optional[str]) -> Optional[str]:
-    """
-    يحاول استخدام مزودك المحلي (الموجود داخل نفس الريبو).
-    - أولاً: import لموديول بأسماء شائعة.
-    - ثانيًا: تشغيل سكربت CLI إن وجد.
-    يجب أن يعيد الموديول/السكربت اسم المالك كنص.
-    """
+def lookup_owner_from_module(e164: str) -> Optional[str]:
+    if not OWNER_MODULE or not OWNER_FUNC:
+        return None
+    try:
+        mod = __import__(OWNER_MODULE)
+        fn = getattr(mod, OWNER_FUNC, None)
+        if callable(fn):
+            name = fn(e164)
+            if isinstance(name, str) and name.strip():
+                log.info("Owner name resolved via module %s.%s", OWNER_MODULE, OWNER_FUNC)
+                return name.strip()
+    except Exception as e:
+        log.warning("module lookup failed: %s", e)
+    return None
+
+def lookup_owner_from_script(e164: str) -> Optional[str]:
+    if not OWNER_SCRIPT:
+        return None
+    try:
+        # استبدال {number} في ARGS
+        args = OWNER_ARGS.replace("{number}", e164).strip()
+        cmd = ["python", OWNER_SCRIPT] + [a for a in args.split() if a]
+        out = check_output(cmd, timeout=25).decode("utf-8", "ignore").strip()
+        # جرّب JSON أولاً
+        try:
+            j = json.loads(out)
+            val = j.get(OWNER_SCRIPT_JSON_KEY) or j.get("owner") or j.get("caller_name") or j.get("name")
+            if isinstance(val, str) and val.strip():
+                log.info("Owner name resolved via script %s (%s)", OWNER_SCRIPT, OWNER_SCRIPT_JSON_KEY)
+                return val.strip()
+        except Exception:
+            # لو مش JSON، خذ آخر سطر نصي
+            if out:
+                line = out.splitlines()[-1].strip()
+                if line:
+                    log.info("Owner name resolved via script raw text")
+                    return line
+    except (CalledProcessError, TimeoutExpired) as e:
+        log.warning("script lookup failed: %s", e)
+    return None
+
+def lookup_owner_name(e164: Optional[str]) -> Optional[str]:
     if not e164:
         return None
-
-    # 1) محاولة import لموديولات شائعة
-    module_names = [
-        "who_is_this", "whoisthis", "who_is_this_main", "who_is_owner", "owner_lookup"
-    ]
-    for mname in module_names:
-        try:
-            mod = __import__(mname)
-            # جرّب دوال شائعة
-            for fn in ("lookup_owner", "get_owner", "owner_name", "lookup"):
-                if hasattr(mod, fn):
-                    name = getattr(mod, fn)(e164)
-                    if isinstance(name, str) and name.strip():
-                        return name.strip()
-        except Exception:
-            pass
-
-    # 2) محاولة تشغيل سكربت CLI داخل الريبو
-    # أمثلة أسماء محتملة:
-    script_names = [
-        "who_is_this.py", "whoisthis.py", "main.py", "lookup.py", "owner_lookup.py"
-    ]
-    import subprocess, json, shlex
-    for sname in script_names:
-        if os.path.exists(os.path.join(os.getcwd(), sname)):
-            try:
-                # نفترض أن السكربت يقبل --number ويرجع JSON فيه name/owner/caller_name
-                cmd = ["python", sname, "--number", e164, "--json"]
-                out = subprocess.check_output(cmd, timeout=25).decode("utf-8", "ignore")
-                # حاول JSON
-                try:
-                    j = json.loads(out)
-                    for key in ("name", "owner", "caller_name"):
-                        if key in j and str(j[key]).strip():
-                            return str(j[key]).strip()
-                except Exception:
-                    # جرّب أن الإخراج نصي فقط
-                    line = out.strip().splitlines()[-1].strip() if out.strip() else ""
-                    if line:
-                        return line
-            except Exception:
-                pass
-
+    # 1) جرّب الموديول
+    name = lookup_owner_from_module(e164)
+    if name:
+        return name
+    # 2) جرّب السكربت
+    name = lookup_owner_from_script(e164)
+    if name:
+        return name
+    log.info("Owner name not found (module/script not configured or returned empty).")
     return None
 
 def phone_summary(raw: str, default_region: Optional[str] = None) -> str:
@@ -284,7 +294,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلًا 👋\n"
         "الأوامر المتاحة:\n"
-        "/phone — استخراج تفاصيل رقم جوال (+ اسم المالك من مزودك المحلي إن وُجد)\n"
+        "/phone — استخراج تفاصيل رقم جوال (+ اسم المالك إذا ضبطت OWNER_MODULE/OWNER_SCRIPT)\n"
         "/ig — معلومات إنستغرام\n"
         "/cancel — إلغاء العملية الحالية"
     )
@@ -298,11 +308,10 @@ async def phone_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def phone_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = (update.message.text or "").strip()
+    e164 = to_e164(user_input, default_region="SA")
     result = phone_summary(user_input, default_region="SA")
 
-    # اسم صاحب الرقم عبر مزودك المحلي (إن وُجد)
-    e164 = to_e164(user_input, default_region="SA")
-    owner = lookup_owner_name_local(e164)
+    owner = lookup_owner_name(e164)
     if owner:
         result += f"\n- Owner Name: {owner}"
 
@@ -332,7 +341,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "تعليمات وأوامر"),
-        BotCommand("phone", "تحليل رقم جوال (+اسم محلي)"),
+        BotCommand("phone", "تحليل رقم جوال (+اسم)"),
         BotCommand("ig", "معلومات إنستغرام"),
         BotCommand("cancel", "إلغاء العملية الحالية"),
     ])
@@ -362,7 +371,7 @@ def main():
     app.add_handler(conv_phone)
     app.add_handler(conv_ig)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
